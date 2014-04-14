@@ -92,6 +92,11 @@ typedef struct _HashEntry {
 	int scc_index;
 } HashEntry;
 
+typedef struct {
+	HashEntry entry;
+	double weight;
+} HashEntryWithAccounting;
+
 typedef struct _SCC {
 	int index;
 	int api_index;
@@ -99,7 +104,7 @@ typedef struct _SCC {
 	DynIntArray xrefs;		/* these are incoming, not outgoing */
 } SCC;
 
-static SgenHashTable hash_table = SGEN_HASH_TABLE_INIT (INTERNAL_MEM_BRIDGE_HASH_TABLE, INTERNAL_MEM_BRIDGE_HASH_TABLE_ENTRY, sizeof (HashEntry), mono_aligned_addr_hash, NULL);
+static SgenHashTable hash_table;
 
 static MonoGCBridgeCallbacks bridge_callbacks;
 
@@ -107,6 +112,7 @@ static int current_time;
 
 gboolean bridge_processing_in_progress = FALSE;
 
+static gboolean bridge_accounting_enabled = FALSE;
 
 
 /* Core functions */
@@ -404,6 +410,12 @@ mono_gc_wait_for_bridge_processing (void)
 void
 mono_gc_register_bridge_callbacks (MonoGCBridgeCallbacks *callbacks)
 {
+	bridge_accounting_enabled = g_getenv ("SGEN_BRIDGE_ACCOUNTING") != NULL;
+	 if (bridge_accounting_enabled)
+		hash_table = (SgenHashTable)SGEN_HASH_TABLE_INIT (INTERNAL_MEM_BRIDGE_HASH_TABLE, INTERNAL_MEM_BRIDGE_HASH_TABLE_ENTRY, sizeof (HashEntryWithAccounting), mono_aligned_addr_hash, NULL);
+	else
+		hash_table = (SgenHashTable)SGEN_HASH_TABLE_INIT (INTERNAL_MEM_BRIDGE_HASH_TABLE, INTERNAL_MEM_BRIDGE_HASH_TABLE_ENTRY, sizeof (HashEntry), mono_aligned_addr_hash, NULL);
+
 	if (callbacks->bridge_version != SGEN_BRIDGE_VERSION)
 		g_error ("Invalid bridge callback version. Expected %d but got %d\n", SGEN_BRIDGE_VERSION, callbacks->bridge_version);
 
@@ -771,6 +783,25 @@ sgen_bridge_processing_finish (int generation)
 		}
 	}
 
+	if (bridge_accounting_enabled) {
+		for (i = hash_table.num_entries - 1; i >= 0; --i) {
+			double w;
+			HashEntryWithAccounting *entry = (HashEntryWithAccounting*)all_entries [i];
+
+			entry->weight += (double)sgen_safe_object_get_size (entry->entry.obj);
+			w = entry->weight / dyn_array_ptr_size (&entry->entry.srcs);
+			for (j = 0; j < dyn_array_ptr_size (&entry->entry.srcs); ++j) {
+				HashEntryWithAccounting *other = (HashEntryWithAccounting *)dyn_array_ptr_get (&entry->entry.srcs, j);
+				other->weight += w;
+			}
+		}
+		for (i = 0; i < hash_table.num_entries; ++i) {
+			HashEntryWithAccounting *entry = (HashEntryWithAccounting*)all_entries [i];
+			if (entry->entry.is_bridge)
+				mono_trace (G_LOG_LEVEL_INFO, MONO_TRACE_GC, "OBJECT %s (%p) weigth %f", sgen_safe_name (entry->entry.obj), entry->entry.obj, entry->weight);
+		}
+	}
+
 	sccs_size = dyn_array_scc_size (&sccs);
 
 	for (i = 0; i < hash_table.num_entries; ++i) {
@@ -890,12 +921,24 @@ sgen_bridge_processing_finish (int generation)
 		}
 	}
 
+
 	/* Null weak links to dead objects. */
 	sgen_null_links_with_predicate (GENERATION_NURSERY, is_bridge_object_alive, &alive_hash);
 	if (generation == GENERATION_OLD)
 		sgen_null_links_with_predicate (GENERATION_OLD, is_bridge_object_alive, &alive_hash);
 
 	sgen_hash_table_clean (&alive_hash);
+
+	if (bridge_accounting_enabled) {
+		for (i = 0; i < num_sccs; ++i) {
+			for (j = 0; j < api_sccs [i]->num_objs; ++j)
+				mono_trace (G_LOG_LEVEL_INFO, MONO_TRACE_GC, 
+					"OBJECT %s (%p) SCC [%d] %s", 
+						sgen_safe_name (api_sccs [i]->objs [j]), api_sccs [i]->objs [j], 
+						i,
+						api_sccs [i]->is_alive  ? "ALIVE" : "DEAD");
+		}
+	}
 
 	/* free callback data */
 
